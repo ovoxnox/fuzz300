@@ -1,111 +1,80 @@
 #!/usr/bin/env python3
+# Async BFS crawler: worker pool over a queue, depth
 
 import re
-import gc
 import asyncio
-import logging
-
-from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-from typing import List
-from strongtyping.config import SEVERITY_LEVEL
-from strongtyping.strong_typing import match_typing
+from .utils import normalize_url, same_domain, is_page, is_js
+from .aopener import Fetcher
 
-from modules.aopener import session, aget
+TAG_ATTRS = (('a', 'href'), ('link', 'href'), ('script', 'src'), ('img', 'src'),
+             ('iframe', 'src'), ('form', 'action'), ('area', 'href'))
+HREF_RE = re.compile(r'''(?:href|src|action)\s*=\s*["']([^"'#]+)["']''', re.I)
+ABS_URL_RE = re.compile(r'''https?://[^\s"'<>)]+''', re.I)
+REL_URL_RE = re.compile(r'''["'](/[^\s"'<>)]*)["']''')
 
+class Crawler:
+    def __init__(self, fetcher, start, domain, max_depth=3, max_urls=3000):
+        self.f = fetcher
+        self.start = start
+        self.domain = domain
+        self.max_depth = max_depth
+        self.max_urls = max_urls
 
-class Crawler():
+    def extract(self, html, base):
+        links, js = set(), set()
+        # regex pass first: cheap, survives malformed HTML
+        for m in HREF_RE.finditer(html):
+            u = normalize_url(m.group(1), base)
+            if u:(js if is_js(u) else links).add(u)
+        for m in ABS_URL_RE.finditer(html):
+            u = normalize_url(m.group(0), base)
+            if u:(js if is_js(u) else links).add(u)
+        # structured pass
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            for tag, attr in TAG_ATTRS:
+                for el in soup.find_all(tag):
+                    u = normalize_url(el.get(attr), base)
+                    if u:(js if is_js(u) else links).add(u)
+        except Exception:pass
+        # relative endpoint strings buried in inline JS / JSON blobs
+        for m in REL_URL_RE.finditer(html):
+            u = normalize_url(m.group(1), base)
+            if u:links.add(u)
+        return links, js
 
-    @match_typing(severity=SEVERITY_LEVEL.WARNING)
-    def __init__(self, urls: List):
-        logging.disable(50)
-        # safe extensions
-        self.ext = ['html', 'php', 'asp', 'aspx', 'jsp', 'cgi']
-        self.domain = urls[0].split('//')[-1].split('www.')[-1]
-        self.finished = False
-        self.depth = 0       # recursion
-        self.visited = []    # main list
-        self.lst = []        # to_visit next
-        self.lst += urls     # base_url
+    async def run(self, workers=30):
+        seen = {self.start}
+        js_files = set()
+        fetched = [0]
+        q = asyncio.Queue()
+        q.put_nowait((self.start, 0))
 
-    @match_typing
-    def check(self, path: str):
-        # checking for full link
-        if path and path.startswith('/'):
-            path = urljoin(self.domain, path)
-        # filtering out non-relative websites
-        if self.domain in path:
-            # checking for extensions
-            if len(path[:-1].split('//')[1].split('/')) > 2:
-                if re.match('.*.*', path):
-                    # filtering out website asset files
-                    return self.recheck(path)
-            return path
+        async def worker():
+            while True:
+                try:url, depth = q.get_nowait()
+                except asyncio.QueueEmpty:return
+                if fetched[0] >= self.max_urls:return
+                resp = await self.f.fetch(url)
+                fetched[0] += 1
+                if resp.status and resp.body and not resp.error:
+                    try:links, js = self.extract(resp.text, url)
+                    except Exception:links, js = set(), set()
+                    js_files.update(u for u in js if same_domain(u, self.domain))
+                    if depth < self.max_depth:
+                        for u in links:
+                            if (u not in seen and same_domain(u, self.domain)
+                                    and is_page(u)):
+                                seen.add(u)
+                                if fetched[0] + q.qsize() < self.max_urls:
+                                    q.put_nowait((u, depth + 1))
+                if fetched[0] % 100 == 0:
+                    print(f'[{self.domain}] crawled {fetched[0]} ...', end='\r')
 
-    @match_typing
-    def recheck(self, path: str):
-        for e in self.ext:
-            if path.endswith(e):
-                return path
-        # filtering extensions that are out the list
-        _ = path.split('?')
-        for n in range(-7, -2):
-            try:
-                if len(_) > 2:
-                    if any(c == '.' for c in [_[-1][n], _[-2][n]]):
-                        return False
-                else:
-                    if any(c == '.' for c in _[0][n]):
-                        return False
-            except:
-                continue
-        return path
-
-    @match_typing
-    async def run(self, urls: List):
-        # main crawl function
-        print(f'Now crawling:\n') 
-        while not self.finished:
-            # recursion
-            self.depth += 1
-            # cycle exit rules
-            if (len(self.visited)) > 3000:
-                self.finished = True
-            elif len(self.lst) == 0:
-                self.finished = True
-            elif self.depth > 3:
-                self.finished = True
-            # release to_visit list
-            doc = await session(self.lst, sem=500)
-            self.visited += self.lst
-            for _ in self.lst:
-                self.lst.remove(_)
-
-            # parse all links
-            for html in doc:
-                try: # method #1
-                    soup = BeautifulSoup(html, 'html.parser')
-                    for link in soup.find_all('a'):
-                        path = link.get('href')
-                        if path and (_ := self.check(path)) not in self.visited:
-                            self.lst.append(_)
-                except Exception as e:
-                    pass
-
-                try: # method #2
-                    for link in re.findall('(?<=href=["\'])https?://.+?(?=["\'])', html.decode('utf-8')):
-                        if link and (_ := self.check(link)) not in self.visited:
-                            self.lst.append(_)
-                except Exception as e:
-                    pass
-            del doc
-            # collecting garbage
-            gc.collect()
-            self.lst = list(set(self.lst))
-
-        # write all crawled links to the file
-        with open('urls.txt', 'w') as f:
-            for l in list(set(self.visited)):
-                f.write(f'{l}\n')
-        print(f'\nTotal crawled: {len(self.visited)} urls\n')
+        tasks = [asyncio.create_task(worker()) for _ in range(workers)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print(f'\n[{self.domain}] crawl done: {len(seen)} urls discovered, '
+              f'{fetched[0]} fetched, {len(js_files)} js files')
+        return seen, js_files

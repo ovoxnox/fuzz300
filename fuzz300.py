@@ -1,135 +1,145 @@
 #!/usr/bin/env python3
+# fuzz300 v2 - recon & audit orchestrator.
+# Multiprocessing: -f domains.txt -w N runs N domains in parallel processes.
 
 import os
 import sys
 import asyncio
 import argparse
 
-from itertools import chain
-from urllib.parse import urlparse
-from typing import List, Any
+from urllib.parse import urlsplit
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from modules.cli import parser
-from modules.utils import *
-from modules.scraper import *
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from modules.cli import build_parser, parse_cookies
+from modules import utils
+from modules.aopener import Fetcher
 from modules.crawler import Crawler
-from modules.fuzzer import fuzz
+from modules.scraper import scrape_forms, scrape_js
+from modules import audit
+from modules.fuzzer import fuzz_endpoints
+from modules.fuzzer import fuzz_endpoints, fuzz_paths
 
-banner = '''
-                __ 
-              .'  '.        .-''-.
-             | 301  |      ;  ,-> :
-              '.__.'       :  |   ; 
-                ||          '-..-'
-                ||
-                ||
-              \\||///
-         ^^^^^^^^^^^^^^^'''
+ACTIVE = {'ssrf', 'smuggle', 'fuzz', 'redirect'}
 
-e_points = []
+async def pipeline(domain, args, modules):
+    base = utils.outdir(args.outdir, domain)
+    start = f'https://{domain}'
+    async with Fetcher(cookies=parse_cookies(args.cookies), timeout=args.timeout,
+                       concurrency=args.concurrency, proxy=args.proxy) as f:
+        # scheme probe: https first, fall back to http
+        r = await f.fetch(start)
+        if r.status == 0 and ('ssl' in r.error.lower() or 'certificate' in r.error.lower()):
+            start = f'http://{domain}'
+            r = await f.fetch(start)
 
-def crawl(url: List):
-    crawl = Crawler(url)
-    asyncio.run(crawl.run(url))
+        report = {'domain': domain, 'start': start, 'modules': sorted(modules)}
+        urls, js_files, js_eps = set(), set(), set()
+        forms, endpoints = [], set()
 
-def scrap(domain: List, _: str, cookies):
-    global e_points
+        if 'crawl' in modules:
+            urls, js_files = await Crawler(f, start, domain,
+                                           args.depth, args.max_urls).run()
+            utils.save_lines(f'{base}/urls.txt', urls)
 
-    urls = open('urls.txt', 'r')
-    links = urls.readlines()
-    links.append(_)
-    links = sorted(links, key=len)
-    links = list(map(lambda a: a.strip(), links))
-    urls.close()
-    os.remove('urls.txt')
+        if 'scrape' in modules:
+            if not urls:
+                urls = {start}
+            forms, eps = await scrape_forms(f, urls, domain)
+            endpoints.update(eps)
+            js_eps = await scrape_js(f, js_files, domain)
+            utils.save_lines(f'{base}/forms.txt', forms)
+            utils.save_lines(f'{base}/js_endpoints.txt', js_eps)
 
-    # filter urls for data-urls
-    _ = []
-    data_urls = []
-    for link in links:
-        if len(urlparse(link).query) > 0:
-            link = filter_links(link, domain[0])
-        if link and link not in data_urls:
-            if (a := link.split('?')[0]) not in _:
-                data_urls.append(link)
-                _.append(a)
+        # any crawled URL with query params becomes a FUZZ entry point
+        for u in urls:
+            z = utils.fuzzable(u)
+            if z:
+                endpoints.add('GET ' + z)
+        endpoints.update(f'GET {u}' for u in js_eps if '?' in u)
+        utils.save_lines(f'{base}/entry_points.txt', sorted(endpoints))
 
-    e_points += data_urls
-    if len(data_urls) > 0:
-        print('Found links with data inside:\n')
-        for url in data_urls:
-            print(url)
-        print('\n\n')
+        get_eps = [e for e in endpoints if e.startswith('GET ')]
+        post_eps = [e for e in endpoints if e.startswith('POST ')]
+        findings = {}
 
+        if 'gap' in modules:
+            findings['gap'] = await audit.gap_audit(f, domain, start, urls, js_eps)
+        if 'redirect' in modules:
+            findings['openredirect'] = await audit.audit_openredirect(f, endpoints)
+        if 'ssrf' in modules:
+            findings['ssrf'] = await audit.audit_ssrf(f, get_eps[:200], oob=args.oob)
+        if 'smuggle' in modules:
+            targets = [e.split(' ', 1)[1] for e in post_eps] or [start]
+            findings['smuggling'] = await audit.probe_smuggling(
+                targets, args.max_smuggle_paths)
+        if 'fuzz' in modules:
+            findings['fuzz'] = await fuzz_endpoints(f, sorted(endpoints),
+                                                    args.payloads)
+            origins = {f'{urlsplit(u).scheme}://{urlsplit(u).netloc}'
+                       for u in urls} or {start}
+            findings['pathfuzz'] = await fuzz_paths(f, sorted(origins),
+                                                    args.paths_file, args.max_paths)
 
-    # get all form tags
-    print('Starting to scrape urls for web-forms!\n')
-    forms = asyncio.run(get_forms(links[:800], cookies))
-    # iterate over forms
-    data = []
-    for form in chain.from_iterable(forms):
-        data.append(form)
+        report['stats'] = {'urls': len(urls), 'forms': len(forms),
+                           'entry_points': len(endpoints), 'js_files': len(js_files)}
+        report['findings'] = findings
+        utils.save_json(f'{base}/report.json', report)
+        return report
 
-    # get form details
-    det = []
-    weburls = []
-    details = asyncio.run(form_details(data, domain[0]))
-    for d in details:
-        if not d or len(d) > 350:
-            continue
-        elif d.split('&')[0] in det:
-            continue
-        weburls.append(d)
-        det.append(d.split('&')[0])
+def scan_domain(domain, ns):
+    modules = {m.strip() for m in ns.modules.split(',') if m.strip()}
+    try:return asyncio.run(pipeline(domain, ns, modules))
+    except KeyboardInterrupt:raise
+    except Exception as e:return {'domain': domain, 'error': f'\
+    					{type(e).__name__}: {e}'}
 
-    # remove duplicates
-    weburls = list(set(weburls))
+def read_domains(args) -> List:
+    raw = []
+    if args.url:raw.append(args.url)
+    if args.file:raw += utils.load_lines(args.file)
+    out = []
+    for item in raw:
+        _= utils.normalize_url(item if '://' in item else 'http://' + item)
+        try:d = utils.domain_of(_);out.append(d) if d and d not in out else ''
+        except:pass
+    return out
 
-    # filter results
-    for webf in weburls:
-        if webf.lstrip('GET ').startswith('http'):
-            webf = filter_links(webf.lstrip('GET '), domain[0])
-            e_points.append(webf)
-        else:
-            with open('js_webforms.txt', 'a') as f:
-                f.write(f'{webf}\n')
+def summarize(rep):
+    print(f'\n=== {rep["domain"]} ===')
+    if 'error' in rep:
+        print('  ERROR:', rep['error'])
+        return
+    s = rep.get('stats', {})
+    print(f'  crawled {s.get("urls", 0)} urls | forms {s.get("forms", 0)} | '
+          f'entry points {s.get("entry_points", 0)} | js files {s.get("js_files", 0)}')
+    for mod, f in rep.get('findings', {}).items():
+        n = len(f) if isinstance(f, list) else (1 if f else 0)
+        print(f'  {mod:<13} {n} finding(s)')
 
-    if len(e_points) == 0:
-        print("Haven't found any valid url or web-form to start fuzzing. Exiting..")
-        sys.exit(0)
-    else:
-        # write all valid entry points to the file
-        with open('entry_points.txt', 'w') as f:
-            for p in e_points:
-                if len(p.split('?')) > 1:
-                    f.write(f'{p}\n')
-
-def openredirect():
-    global e_points
-
-    par = ['away', 'out', 'next', 'dest', 'target', 'url', 'rurl', 'redir', 
-        'destination', 'redirect_uri', 'redirect_url', 'redirect', 'view', 
-        'login', 'image_url', 'go', 'return','checkout', 'continue', 'path']
-
-    print('Starting to fuzz urls to find open-redirect vulnerability\n')
-    for url in e_points:
-        try:
-            fuzz(url, ['data/openredirect.json'], 'data/openredirect.txt')
-        except KeyboardInterrupt:
-            sys.exit(0)
-
+def main():
+    args = build_parser().parse_args()
+    print(utils.BANNER)
+    domains = read_domains(args)
+    if not domains:
+        print('no targets given (use -u or -f)')
+        sys.exit(1)
+    print(f'\n{len(domains)} target(s), {args.workers} worker process(es)\n')
+    results = []
+    try:
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(scan_domain, d, args): d for d in domains}
+            for fut in as_completed(futs):
+                d = futs[fut]
+                try:rep = fut.result()
+                except Exception as e:rep = {'domain': d, 'error': str(e)}
+                results.append(rep)
+                summarize(rep)
+    except KeyboardInterrupt:
+        print('\ninterrupted - partial reports are on disk')
+    _=sum(1 for r in results if 'error' not in r)
+    print(f'\ndone: {_}/{len(domains)} target(s) scanned -> {args.outdir}/')
 
 if __name__ == '__main__':
-    args = parser.parse_args()
-    print(banner)
-    clear()
-
-    url = args.url.split()
-    domain = url[0].split('//')[-1].split('www.')[-1]
-    domain = domain.split()
-
-    crawl(url)
-    scrap(domain, args.url, args.cookies)
-    openredirect()
-
-
+    main()

@@ -1,59 +1,58 @@
 #!/usr/bin/env python3
+# Form extraction + JS endpoint mining
 
-import sys
-import gc
-import asyncio
+import re
 
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urlencode, urljoin
 from bs4 import BeautifulSoup
-from typing import List, Any
-from strongtyping.strong_typing import match_typing
+from typing import Set
 
-from modules.aopener import session, aget
+from .utils import same_domain
 
+# strings in JS that look like endpoints: 
+#	/api/v1/x, /path/{id}, /x?y=1
+JS_EP_RE = re.compile(
+    r'''["'](/(?:[A-Za-z0-9_\-\.]+/)+[A-Za-z0-9_\-\.]*(?:\{[A-Za-z0-9_]+\})?(?:\?[A-Za-z0-9_=&\-\.]+)?)["']''')
 
-async def get_forms(urls: List, c: Any):
-    html_list = await session(urls, cookies=c)
-    print('\n')
-    forms = []
-    for i, html in enumerate(html_list, start=1):
-        print(f'Trying to find forms: {i} / {len(html_list)}', end='\r')
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            forms.append(soup.find_all("form"))
-        except:
-            continue
-    # collecting garbage
-    del html_list
-    gc.collect()
-    return forms
+async def scrape_forms(fetcher, urls, domain, limit=1500):
+    pages = sorted(urls, key=len)[:limit]
+    forms, endpoints = [], set()
+    done = [0]
 
-@match_typing
-async def form_details(forms: List, d: str):
-    # get all forms details
-    tasks = []
-    for form in forms:
-        tasks.append(asyncio.create_task(details(form, d)))
-    return await asyncio.gather(*tasks)
+    def on_each(r):
+        done[0] += 1
+        print(f'[{domain}] scraping forms {done[0]}/{len(pages)}', end='\r')
 
-@match_typing
-async def details(form: Any, domain: str):
-    # returns action, method and form controls
-    details =  f'{form.attrs.get("method", "GET")} '.upper()
-    if (ac := form.attrs.get("action")): 
-        ac = urljoin(f'https://{domain}', ac, allow_fragments=True)
-        details += ac
-        if form.attrs.get("action").startswith('http'):
-            if domain not in form.attrs.get("action"):
-                return False
-    for i, i_tag in enumerate(form.find_all("input"), start=1):
-        delim = '?' if i == 1 else '&'
-        details += f'{delim}{i_tag.attrs.get("name")}='
-        details += i_tag.attrs.get("value", "FUZZ")
-#       if i_tag.attrs.get("type") == "submit":
-#           return False
-    return details
+    resps = await fetcher.fetch_many(pages, workers=40, on_each=on_each)
+    for r in resps:
+        if not r.body or r.status >= 400:continue
+        try:soup = BeautifulSoup(r.text, 'html.parser')
+        except Exception:continue
+        for form in soup.find_all('form'):
+            method = (form.get('method') or 'GET').upper()
+            action = urljoin(r.url, form.get('action') or r.url)
+            if not same_domain(action, domain):continue
+            params = []
+            for tag in form.find_all(('input', 'select', 'textarea', 'button')):
+                name = tag.get('name')
+                if not name:continue
+                if tag.name == 'input' and tag.get('type', '').lower() in ('submit', 'button', 'image'):continue
+                val = tag.get('value') or 'FUZZ'
+                params.append((name, val))
+            if not params:continue
+            qs = urlencode(params)
+            forms.append(f'{method} {action} :: {qs}')
+            endpoints.add(f'{method} {action}?{qs}')
+    return forms, endpoints
 
-
-
-
+async def scrape_js(fetcher, js_urls, domain, limit=200) -> Set:
+    if not js_urls:return set()
+    resps = await fetcher.fetch_many(list(js_urls)[:limit], workers=30)
+    out = set()
+    for r in resps:
+        if not r.body:continue
+        for m in JS_EP_RE.finditer(r.text):
+            ep = m.group(1)
+            if len(ep) > 160 or ' ' in ep:continue
+            out.add(urljoin(f'https://{domain}/', ep))
+    return out
