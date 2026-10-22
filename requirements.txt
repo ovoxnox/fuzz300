@@ -1,3 +1,2 @@
 bs4
-wfuzz
-strongtyping
+aiohttp
